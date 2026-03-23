@@ -22,10 +22,12 @@ BASE_COLOR = 'black'
 BASE_LINEWIDTH = 2.6
 VARIANT_LINEWIDTH = 1.3
 VARIANT_ALPHA = 0.8
+BODY_QUAT_ORDER = 'wxyz'
 
-BODY_POSE_JOINT_NAMES = JOINT_NAMES[1:22]
-BODY_POSE_JOINT_INDEX = {name: idx for idx, name in enumerate(BODY_POSE_JOINT_NAMES)}
-JOINT_INDEX = {name: idx for idx, name in enumerate(JOINT_NAMES)}
+BODY_NAMES_FALLBACK = tuple(JOINT_NAMES[:22])
+BODY_PARENT_INDICES = (
+    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19,
+)
 
 SELECTED_BODY_SPECS = [
     ('pelvis_body', ('joint', 'pelvis')),
@@ -37,16 +39,14 @@ SELECTED_BODY_SPECS = [
     ('right_shank_body', ('midpoint', 'right_knee', 'right_ankle')),
 ]
 
-SELECTED_DOF_SPECS = [
-    ('root_rx', ('root_orient', 0)),
-    ('root_ry', ('root_orient', 1)),
-    ('root_rz', ('root_orient', 2)),
-    ('left_hip_rx', ('pose_body', 3 * BODY_POSE_JOINT_INDEX['left_hip'] + 0)),
-    ('right_hip_rx', ('pose_body', 3 * BODY_POSE_JOINT_INDEX['right_hip'] + 0)),
-    ('left_knee_rx', ('pose_body', 3 * BODY_POSE_JOINT_INDEX['left_knee'] + 0)),
-    ('right_knee_rx', ('pose_body', 3 * BODY_POSE_JOINT_INDEX['right_knee'] + 0)),
-    ('left_shoulder_rz', ('pose_body', 3 * BODY_POSE_JOINT_INDEX['left_shoulder'] + 2)),
-    ('right_shoulder_rz', ('pose_body', 3 * BODY_POSE_JOINT_INDEX['right_shoulder'] + 2)),
+SELECTED_ORIENTATION_BODY_NAMES = [
+    'pelvis',
+    'spine3',
+    'head',
+    'left_foot',
+    'right_foot',
+    'left_wrist',
+    'right_wrist',
 ]
 
 
@@ -100,91 +100,203 @@ def resolve_variant_paths(folder):
     return folder, base_path, variant_paths
 
 
-def validate_variant(base_data, variant_data, variant_path):
-    for key in ['joints', 'root_orient', 'pose_body', 'pose_hand', 'pose_jaw', 'pose_eye']:
-        if key not in variant_data:
-            raise KeyError(f'Missing {key!r} in {variant_path}')
-        if variant_data[key].shape != base_data[key].shape:
-            raise ValueError(
-                f'Shape mismatch for {key!r} in {variant_path}: '
-                f'{variant_data[key].shape} vs base {base_data[key].shape}'
+def to_name_tuple(values):
+    if isinstance(values, np.ndarray):
+        flat = values.reshape(-1).tolist()
+    else:
+        flat = list(values)
+    return tuple(str(to_python(value)) for value in flat)
+
+
+def normalize_last_dim(values, eps=1e-8):
+    values = np.asarray(values, dtype=np.float32)
+    norms = np.linalg.norm(values, axis=-1, keepdims=True)
+    return values / np.clip(norms, eps, None)
+
+
+def axis_angle_to_quat(axis_angle):
+    axis_angle = np.asarray(axis_angle, dtype=np.float32)
+    angles = np.linalg.norm(axis_angle, axis=-1, keepdims=True)
+    half_angles = 0.5 * angles
+    scales = np.where(
+        angles > 1e-8,
+        np.sin(half_angles) / np.clip(angles, 1e-8, None),
+        0.5 - (angles * angles) / 48.0,
+    )
+    quat = np.concatenate([np.cos(half_angles), axis_angle * scales], axis=-1)
+    return normalize_last_dim(quat)
+
+
+def quat_multiply(q1, q2):
+    q1 = np.asarray(q1, dtype=np.float32)
+    q2 = np.asarray(q2, dtype=np.float32)
+    w1, x1, y1, z1 = np.moveaxis(q1, -1, 0)
+    w2, x2, y2, z2 = np.moveaxis(q2, -1, 0)
+    product = np.stack([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], axis=-1)
+    return normalize_last_dim(product)
+
+
+def quat_geodesic_error(q1, q2):
+    q1 = normalize_last_dim(q1)
+    q2 = normalize_last_dim(q2)
+    dot = np.sum(q1 * q2, axis=-1)
+    dot = np.clip(np.abs(dot), 0.0, 1.0)
+    return (2.0 * np.arccos(dot)).astype(np.float32)
+
+
+def build_body_quat_from_dof_pos(dof_pos):
+    dof_pos = np.asarray(dof_pos, dtype=np.float32)
+    expected_dims = 3 * len(BODY_NAMES_FALLBACK)
+    if dof_pos.shape[1] != expected_dims:
+        raise ValueError(
+            f'Expected dof_pos with {expected_dims} channels, got {dof_pos.shape[1]}'
+        )
+
+    num_frames = dof_pos.shape[0]
+    local_axis_angle = dof_pos.reshape(num_frames, len(BODY_NAMES_FALLBACK), 3)
+    local_quat = axis_angle_to_quat(local_axis_angle)
+    body_quat = np.empty_like(local_quat)
+    for joint_idx, parent_idx in enumerate(BODY_PARENT_INDICES):
+        if parent_idx < 0:
+            body_quat[:, joint_idx, :] = local_quat[:, joint_idx, :]
+        else:
+            body_quat[:, joint_idx, :] = quat_multiply(
+                body_quat[:, parent_idx, :],
+                local_quat[:, joint_idx, :],
             )
+    return normalize_last_dim(body_quat).astype(np.float32)
 
 
-def extract_body_series(joints):
+def standardize_variant_data(raw_data, variant_path):
+    compact_keys = {'body_names', 'body_pos', 'body_quat', 'betas', 'hz'}
+    if compact_keys.issubset(raw_data.keys()):
+        return {
+            'variant_name': Path(variant_path).stem,
+            'body_names': to_name_tuple(raw_data['body_names']),
+            'body_pos': np.asarray(raw_data['body_pos'], dtype=np.float32),
+            'body_quat': np.asarray(raw_data['body_quat'], dtype=np.float32),
+            'betas': np.asarray(raw_data['betas'], dtype=np.float32),
+            'hz': float(to_python(raw_data['hz'])),
+            'body_quat_order': BODY_QUAT_ORDER,
+        }
+
+    old_compact_keys = {'body_names', 'dof_names', 'body_pos', 'dof_pos', 'betas', 'hz'}
+    if old_compact_keys.issubset(raw_data.keys()):
+        dof_pos = np.asarray(raw_data['dof_pos'], dtype=np.float32)
+        return {
+            'variant_name': Path(variant_path).stem,
+            'body_names': to_name_tuple(raw_data['body_names']),
+            'body_pos': np.asarray(raw_data['body_pos'], dtype=np.float32),
+            'body_quat': build_body_quat_from_dof_pos(dof_pos),
+            'betas': np.asarray(raw_data['betas'], dtype=np.float32),
+            'hz': float(to_python(raw_data['hz'])),
+            'body_quat_order': BODY_QUAT_ORDER,
+        }
+
+    legacy_keys = {'joints', 'root_orient', 'pose_body', 'betas'}
+    if legacy_keys.issubset(raw_data.keys()):
+        hz = float(to_python(raw_data['mocap_frame_rate'])) if 'mocap_frame_rate' in raw_data else float(to_python(raw_data['hz']))
+        body_pos = np.asarray(raw_data['joints'][:, :len(BODY_NAMES_FALLBACK), :], dtype=np.float32)
+        dof_pos = np.concatenate(
+            [np.asarray(raw_data['root_orient'], dtype=np.float32), np.asarray(raw_data['pose_body'], dtype=np.float32)],
+            axis=1,
+        ).astype(np.float32)
+        return {
+            'variant_name': Path(variant_path).stem,
+            'body_names': BODY_NAMES_FALLBACK,
+            'body_pos': body_pos,
+            'body_quat': build_body_quat_from_dof_pos(dof_pos),
+            'betas': np.asarray(raw_data['betas'], dtype=np.float32),
+            'hz': hz,
+            'body_quat_order': BODY_QUAT_ORDER,
+        }
+
+    raise KeyError(
+        f'Unrecognized variant format in {variant_path}. Found keys: {sorted(raw_data.keys())}'
+    )
+
+
+def validate_variant(base_data, variant_data, variant_path):
+    if variant_data['body_names'] != base_data['body_names']:
+        raise ValueError(f'Body-name mismatch in {variant_path}')
+    if variant_data['body_pos'].shape != base_data['body_pos'].shape:
+        raise ValueError(
+            f"Shape mismatch for 'body_pos' in {variant_path}: "
+            f"{variant_data['body_pos'].shape} vs base {base_data['body_pos'].shape}"
+        )
+    if variant_data['body_quat'].shape != base_data['body_quat'].shape:
+        raise ValueError(
+            f"Shape mismatch for 'body_quat' in {variant_path}: "
+            f"{variant_data['body_quat'].shape} vs base {base_data['body_quat'].shape}"
+        )
+
+
+def build_name_to_index(names):
+    return {name: idx for idx, name in enumerate(names)}
+
+
+def extract_body_series(data):
+    name_to_index = build_name_to_index(data['body_names'])
+    body_pos = data['body_pos']
     series = {}
     for name, spec in SELECTED_BODY_SPECS:
         kind = spec[0]
         if kind == 'joint':
             joint_name = spec[1]
-            series[name] = joints[:, JOINT_INDEX[joint_name], :].astype(np.float32)
+            series[name] = body_pos[:, name_to_index[joint_name], :].astype(np.float32)
         elif kind == 'midpoint':
-            joint_a = joints[:, JOINT_INDEX[spec[1]], :]
-            joint_b = joints[:, JOINT_INDEX[spec[2]], :]
+            joint_a = body_pos[:, name_to_index[spec[1]], :]
+            joint_b = body_pos[:, name_to_index[spec[2]], :]
             series[name] = (0.5 * (joint_a + joint_b)).astype(np.float32)
         else:
             raise ValueError(f'Unknown body spec kind: {kind}')
     return series
 
 
-def flatten_all_dofs(data):
-    parts = [
-        data['root_orient'].reshape(data['root_orient'].shape[0], -1),
-        data['pose_body'].reshape(data['pose_body'].shape[0], -1),
-        data['pose_hand'].reshape(data['pose_hand'].shape[0], -1),
-        data['pose_jaw'].reshape(data['pose_jaw'].shape[0], -1),
-        data['pose_eye'].reshape(data['pose_eye'].shape[0], -1),
-    ]
-    return np.concatenate(parts, axis=1).astype(np.float32)
-
-
-def extract_selected_dof_series(data):
+def extract_orientation_series(data):
+    name_to_index = build_name_to_index(data['body_names'])
     series = {}
-    for name, (field_name, index) in SELECTED_DOF_SPECS:
-        field = data[field_name].reshape(data[field_name].shape[0], -1)
-        series[name] = field[:, index].astype(np.float32)
+    for name in SELECTED_ORIENTATION_BODY_NAMES:
+        if name not in name_to_index:
+            raise KeyError(f'Missing selected body orientation {name!r} in variant data')
+        series[name] = data['body_quat'][:, name_to_index[name], :].astype(np.float32)
     return series
 
 
-def stack_series(series_dict):
-    names = list(series_dict.keys())
-    values = np.stack([series_dict[name] for name in names], axis=1)
-    return names, values
+def compute_variant_metrics(base_data, variant_data, base_body_series, base_orientation_series):
+    variant_body_series = extract_body_series(variant_data)
+    variant_orientation_series = extract_orientation_series(variant_data)
 
-
-def compute_variant_metrics(base_data, variant_data, base_body_series, base_all_dofs, base_selected_dofs):
-    variant_body_series = extract_body_series(variant_data['joints'])
-    variant_all_dofs = flatten_all_dofs(variant_data)
-    variant_selected_dofs = extract_selected_dof_series(variant_data)
-
-    _, base_body_stack = stack_series(base_body_series)
-    _, variant_body_stack = stack_series(variant_body_series)
-    body_error = np.linalg.norm(variant_body_stack - base_body_stack, axis=-1)
-
-    dof_error = np.linalg.norm(variant_all_dofs - base_all_dofs, axis=-1)
+    body_error = np.linalg.norm(variant_data['body_pos'] - base_data['body_pos'], axis=-1)
+    orientation_error = quat_geodesic_error(variant_data['body_quat'], base_data['body_quat'])
 
     metrics = {
-        'variant_name': str(to_python(variant_data.get('variant_name', 'unknown'))),
+        'variant_name': variant_data['variant_name'],
         'beta_l2_distance': float(np.linalg.norm(variant_data['betas'] - base_data['betas'])),
         'mean_body_position_error': float(body_error.mean()),
         'min_body_position_error': float(body_error.min()),
         'max_body_position_error': float(body_error.max()),
-        'mean_joint_dof_error': float(dof_error.mean()),
-        'min_joint_dof_error': float(dof_error.min()),
-        'max_joint_dof_error': float(dof_error.max()),
+        'mean_body_orientation_error': float(orientation_error.mean()),
+        'min_body_orientation_error': float(orientation_error.min()),
+        'max_body_orientation_error': float(orientation_error.max()),
         'selected_body_position_mean_errors': {},
-        'selected_joint_dof_max_abs_errors': {},
+        'selected_body_orientation_mean_errors': {},
     }
 
     for name, base_pos in base_body_series.items():
         err = np.linalg.norm(variant_body_series[name] - base_pos, axis=-1)
         metrics['selected_body_position_mean_errors'][name] = float(err.mean())
 
-    for name, base_values in base_selected_dofs.items():
-        err = np.abs(variant_selected_dofs[name] - base_values)
-        metrics['selected_joint_dof_max_abs_errors'][name] = float(err.max())
+    for name, base_quat in base_orientation_series.items():
+        err = quat_geodesic_error(variant_orientation_series[name], base_quat)
+        metrics['selected_body_orientation_mean_errors'][name] = float(err.mean())
 
-    return metrics, variant_body_series, variant_selected_dofs
+    return metrics, variant_body_series, variant_orientation_series
 
 
 def variant_color(index, total):
@@ -226,8 +338,8 @@ def plot_body_trajectories(output_path, title, base_series, variant_series_list)
 
     for ax, name in zip(axes.reshape(-1), names):
         base = base_series[name]
-        ax.plot(base[:, 0], base[:, 2], color=BASE_COLOR, linewidth=BASE_LINEWIDTH, label='base_shape')
-        for idx, (variant_name, variant_series) in enumerate(variant_series_list):
+        ax.plot(base[:, 0], base[:, 2], color=BASE_COLOR, linewidth=BASE_LINEWIDTH)
+        for idx, (_, variant_series) in enumerate(variant_series_list):
             arr = variant_series[name]
             ax.plot(
                 arr[:, 0],
@@ -235,7 +347,6 @@ def plot_body_trajectories(output_path, title, base_series, variant_series_list)
                 color=variant_color(idx, len(variant_series_list)),
                 linewidth=VARIANT_LINEWIDTH,
                 alpha=VARIANT_ALPHA,
-                label=variant_name,
             )
         ax.set_title(name)
         ax.set_xlabel('x [m]')
@@ -254,7 +365,7 @@ def plot_body_error_over_time(output_path, title, time_axis, base_series, varian
     fig.suptitle(title)
 
     for ax, name in zip(axes.reshape(-1), names):
-        for idx, (variant_name, variant_series) in enumerate(variant_series_list):
+        for idx, (_, variant_series) in enumerate(variant_series_list):
             error = np.linalg.norm(variant_series[name] - base_series[name], axis=-1)
             ax.plot(
                 time_axis,
@@ -262,7 +373,6 @@ def plot_body_error_over_time(output_path, title, time_axis, base_series, varian
                 color=variant_color(idx, len(variant_series_list)),
                 linewidth=VARIANT_LINEWIDTH,
                 alpha=VARIANT_ALPHA,
-                label=variant_name,
             )
         ax.set_title(name)
         ax.set_xlabel('time [s]')
@@ -273,53 +383,25 @@ def plot_body_error_over_time(output_path, title, time_axis, base_series, varian
     plt.close(fig)
 
 
-def plot_dof_traces(output_path, title, time_axis, base_series, variant_series_list):
+def plot_orientation_error_over_time(output_path, title, time_axis, base_series, variant_series_list):
     names = list(base_series.keys())
     nrows, ncols = make_grid(len(names), max_cols=3)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 3.0 * nrows), squeeze=False)
     fig.suptitle(title)
 
     for ax, name in zip(axes.reshape(-1), names):
-        base = base_series[name]
-        ax.plot(time_axis, base, color=BASE_COLOR, linewidth=BASE_LINEWIDTH, label='base_shape')
-        for idx, (variant_name, variant_series) in enumerate(variant_series_list):
-            ax.plot(
-                time_axis,
-                variant_series[name],
-                color=variant_color(idx, len(variant_series_list)),
-                linewidth=VARIANT_LINEWIDTH,
-                alpha=VARIANT_ALPHA,
-                label=variant_name,
-            )
-        ax.set_title(name)
-        ax.set_xlabel('time [s]')
-        ax.set_ylabel('axis-angle component [rad]')
-
-    finalize_grid(fig, axes, len(names))
-    fig.savefig(output_path, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_dof_error_over_time(output_path, title, time_axis, base_series, variant_series_list):
-    names = list(base_series.keys())
-    nrows, ncols = make_grid(len(names), max_cols=3)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 3.0 * nrows), squeeze=False)
-    fig.suptitle(title)
-
-    for ax, name in zip(axes.reshape(-1), names):
-        for idx, (variant_name, variant_series) in enumerate(variant_series_list):
-            error = np.abs(variant_series[name] - base_series[name])
+        for idx, (_, variant_series) in enumerate(variant_series_list):
+            error = quat_geodesic_error(variant_series[name], base_series[name])
             ax.plot(
                 time_axis,
                 error,
                 color=variant_color(idx, len(variant_series_list)),
                 linewidth=VARIANT_LINEWIDTH,
                 alpha=VARIANT_ALPHA,
-                label=variant_name,
             )
         ax.set_title(name)
         ax.set_xlabel('time [s]')
-        ax.set_ylabel('joint_dof_error [rad]')
+        ax.set_ylabel('body_orientation_error [rad]')
 
     finalize_grid(fig, axes, len(names))
     fig.savefig(output_path, bbox_inches='tight')
@@ -331,16 +413,16 @@ def plot_metric_bars(output_path, metrics_list):
         ('mean_body_position_error', 'mean_body_position_error [m]'),
         ('min_body_position_error', 'min_body_position_error [m]'),
         ('max_body_position_error', 'max_body_position_error [m]'),
-        ('mean_joint_dof_error', 'mean_joint_dof_error [rad]'),
-        ('min_joint_dof_error', 'min_joint_dof_error [rad]'),
-        ('max_joint_dof_error', 'max_joint_dof_error [rad]'),
+        ('mean_body_orientation_error', 'mean_body_orientation_error [rad]'),
+        ('min_body_orientation_error', 'min_body_orientation_error [rad]'),
+        ('max_body_orientation_error', 'max_body_orientation_error [rad]'),
     ]
     variant_names = [item['variant_name'] for item in metrics_list]
     x = np.arange(len(variant_names))
     colors = [variant_color(idx, len(metrics_list)) for idx in range(len(metrics_list))]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 8), squeeze=False)
-    fig.suptitle('Variant body_position_error and joint_dof_error metrics')
+    fig.suptitle('Variant body_position_error and body_orientation_error metrics')
 
     for ax, (key, title) in zip(axes.reshape(-1), metric_specs):
         values = [item[key] for item in metrics_list]
@@ -360,9 +442,9 @@ def write_csv(output_path, metrics_list):
         'mean_body_position_error',
         'min_body_position_error',
         'max_body_position_error',
-        'mean_joint_dof_error',
-        'min_joint_dof_error',
-        'max_joint_dof_error',
+        'mean_body_orientation_error',
+        'min_body_orientation_error',
+        'max_body_orientation_error',
     ]
     with output_path.open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -377,9 +459,9 @@ def build_summary(folder, base_path, variant_paths, base_data, metrics_list):
         'mean_body_position_error',
         'min_body_position_error',
         'max_body_position_error',
-        'mean_joint_dof_error',
-        'min_joint_dof_error',
-        'max_joint_dof_error',
+        'mean_body_orientation_error',
+        'min_body_orientation_error',
+        'max_body_orientation_error',
         'beta_l2_distance',
     ]
     for key in keys:
@@ -394,11 +476,13 @@ def build_summary(folder, base_path, variant_paths, base_data, metrics_list):
         'folder': str(folder),
         'base_variant_file': str(base_path.name),
         'num_variants': len(variant_paths),
-        'num_frames': int(base_data['joints'].shape[0]),
-        'num_smplx_joints': int(base_data['joints'].shape[1]),
+        'num_frames': int(base_data['body_pos'].shape[0]),
+        'num_bodies': int(base_data['body_pos'].shape[1]),
+        'body_names': list(base_data['body_names']),
+        'body_quat_order': BODY_QUAT_ORDER,
         'selected_bodies': [name for name, _ in SELECTED_BODY_SPECS],
-        'selected_joint_dofs': [name for name, _ in SELECTED_DOF_SPECS],
-        'mocap_frame_rate': float(to_python(base_data['mocap_frame_rate'])),
+        'selected_body_orientations': list(SELECTED_ORIENTATION_BODY_NAMES),
+        'hz': float(base_data['hz']),
         'aggregate_metrics': aggregate,
         'per_variant': metrics_list,
     }
@@ -406,15 +490,15 @@ def build_summary(folder, base_path, variant_paths, base_data, metrics_list):
 
 def print_summary(metrics_list):
     print('Variant comparison summary:')
-    print('variant                beta_l2   mean_body_position_error   max_body_position_error   mean_joint_dof_error   max_joint_dof_error')
+    print('variant                beta_l2   mean_body_position_error   max_body_position_error   mean_body_orientation_error   max_body_orientation_error')
     for item in metrics_list:
         print(
             f"{item['variant_name']:<20} "
             f"{item['beta_l2_distance']:>8.4f} "
             f"{item['mean_body_position_error']:>10.4f} "
             f"{item['max_body_position_error']:>9.4f} "
-            f"{item['mean_joint_dof_error']:>9.6f} "
-            f"{item['max_joint_dof_error']:>8.6f}"
+            f"{item['mean_body_orientation_error']:>10.6f} "
+            f"{item['max_body_orientation_error']:>9.6f}"
         )
 
 
@@ -426,31 +510,29 @@ def main():
     output_dir = folder / OUTPUT_SUBDIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    base_data = load_npz_dict(base_path)
-    base_body_series = extract_body_series(base_data['joints'])
-    base_all_dofs = flatten_all_dofs(base_data)
-    base_selected_dofs = extract_selected_dof_series(base_data)
-    fps = float(to_python(base_data['mocap_frame_rate']))
-    time_axis = np.arange(base_data['joints'].shape[0], dtype=np.float32) / fps
+    base_data = standardize_variant_data(load_npz_dict(base_path), base_path)
+    base_body_series = extract_body_series(base_data)
+    base_orientation_series = extract_orientation_series(base_data)
+    fps = float(base_data['hz'])
+    time_axis = np.arange(base_data['body_pos'].shape[0], dtype=np.float32) / fps
 
     metrics_list = []
     body_variant_series = []
-    dof_variant_series = []
+    orientation_variant_series = []
 
     for variant_path in variant_paths:
-        variant_data = load_npz_dict(variant_path)
+        variant_data = standardize_variant_data(load_npz_dict(variant_path), variant_path)
         validate_variant(base_data, variant_data, variant_path)
-        metrics, variant_body_series, variant_selected_dofs = compute_variant_metrics(
+        metrics, variant_body_series, variant_orientation_series = compute_variant_metrics(
             base_data,
             variant_data,
             base_body_series,
-            base_all_dofs,
-            base_selected_dofs,
+            base_orientation_series,
         )
         metrics['npz_file'] = variant_path.name
         metrics_list.append(metrics)
         body_variant_series.append((metrics['variant_name'], variant_body_series))
-        dof_variant_series.append((metrics['variant_name'], variant_selected_dofs))
+        orientation_variant_series.append((metrics['variant_name'], variant_orientation_series))
 
     plot_body_trajectories(
         output_dir / 'selected_body_trajectories_xz.png',
@@ -465,19 +547,12 @@ def main():
         base_body_series,
         body_variant_series,
     )
-    plot_dof_traces(
-        output_dir / 'selected_joint_dof_traces.png',
-        'Selected Joint DOF Traces',
+    plot_orientation_error_over_time(
+        output_dir / 'selected_body_orientation_error_over_time.png',
+        'Selected body_orientation_error vs Base Shape',
         time_axis,
-        base_selected_dofs,
-        dof_variant_series,
-    )
-    plot_dof_error_over_time(
-        output_dir / 'selected_joint_dof_error_over_time.png',
-        'Selected joint_dof_error vs Base Shape',
-        time_axis,
-        base_selected_dofs,
-        dof_variant_series,
+        base_orientation_series,
+        orientation_variant_series,
     )
     plot_metric_bars(output_dir / 'variant_error_metrics.png', metrics_list)
 

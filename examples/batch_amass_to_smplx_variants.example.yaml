@@ -1,0 +1,14 @@
+# Example config for examples/batch_amass_to_smplx_variants.py
+model_folder: /home/famadio/Workspace/smplx/models
+output_root: /home/famadio/Workspace/smplx/output/amass_batch_example
+motion_root: /home/famadio/Workspace/smplx
+num_random_shapes: 15
+seed: 0
+output_fps: 50
+device: cpu
+render_videos: false
+motions:
+  - path: ACCAD/Female1General_c3d/A10_-_lie_to_crouch_stageii.npz
+  - path: ACCAD/Female1General_c3d/A1_-_Stand_stageii.npz
+    output_subdir: accad_examples/a1_stand  # save the motion in this subdir
+    num_frames: 120  # keep frames from 0 to 120
