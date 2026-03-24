@@ -173,34 +173,52 @@ def build_body_quat_from_dof_pos(dof_pos):
 
 
 def standardize_variant_data(raw_data, variant_path):
-    compact_keys = {'body_names', 'body_pos', 'body_quat', 'betas', 'hz'}
-    if compact_keys.issubset(raw_data.keys()):
+    compact_key_aliases = {
+        'body_names': ('body_link_names', 'body_names'),
+        'body_pos': ('body_pos_w', 'body_pos'),
+        'body_quat': ('body_quat_w', 'body_quat'),
+        'fps': ('fps', 'hz'),
+    }
+    compact_values = {}
+    for canonical_key, aliases in compact_key_aliases.items():
+        for alias in aliases:
+            if alias in raw_data:
+                compact_values[canonical_key] = raw_data[alias]
+                break
+    if 'betas' in raw_data and len(compact_values) == len(compact_key_aliases):
         return {
             'variant_name': Path(variant_path).stem,
-            'body_names': to_name_tuple(raw_data['body_names']),
-            'body_pos': np.asarray(raw_data['body_pos'], dtype=np.float32),
-            'body_quat': np.asarray(raw_data['body_quat'], dtype=np.float32),
+            'body_names': to_name_tuple(compact_values['body_names']),
+            'body_pos': np.asarray(compact_values['body_pos'], dtype=np.float32),
+            'body_quat': np.asarray(compact_values['body_quat'], dtype=np.float32),
             'betas': np.asarray(raw_data['betas'], dtype=np.float32),
-            'hz': float(to_python(raw_data['hz'])),
+            'hz': float(to_python(compact_values['fps'])),
             'body_quat_order': BODY_QUAT_ORDER,
         }
 
-    old_compact_keys = {'body_names', 'dof_names', 'body_pos', 'dof_pos', 'betas', 'hz'}
-    if old_compact_keys.issubset(raw_data.keys()):
+    body_names_key = 'body_link_names' if 'body_link_names' in raw_data else 'body_names' if 'body_names' in raw_data else None
+    fps_key = 'fps' if 'fps' in raw_data else 'hz' if 'hz' in raw_data else None
+    old_compact_keys = {'dof_names', 'body_pos', 'dof_pos', 'betas'}
+    if body_names_key is not None and fps_key is not None and old_compact_keys.issubset(raw_data.keys()):
         dof_pos = np.asarray(raw_data['dof_pos'], dtype=np.float32)
         return {
             'variant_name': Path(variant_path).stem,
-            'body_names': to_name_tuple(raw_data['body_names']),
+            'body_names': to_name_tuple(raw_data[body_names_key]),
             'body_pos': np.asarray(raw_data['body_pos'], dtype=np.float32),
             'body_quat': build_body_quat_from_dof_pos(dof_pos),
             'betas': np.asarray(raw_data['betas'], dtype=np.float32),
-            'hz': float(to_python(raw_data['hz'])),
+            'hz': float(to_python(raw_data[fps_key])),
             'body_quat_order': BODY_QUAT_ORDER,
         }
 
     legacy_keys = {'joints', 'root_orient', 'pose_body', 'betas'}
     if legacy_keys.issubset(raw_data.keys()):
-        hz = float(to_python(raw_data['mocap_frame_rate'])) if 'mocap_frame_rate' in raw_data else float(to_python(raw_data['hz']))
+        if 'mocap_frame_rate' in raw_data:
+            hz = float(to_python(raw_data['mocap_frame_rate']))
+        elif 'fps' in raw_data:
+            hz = float(to_python(raw_data['fps']))
+        else:
+            hz = float(to_python(raw_data['hz']))
         body_pos = np.asarray(raw_data['joints'][:, :len(BODY_NAMES_FALLBACK), :], dtype=np.float32)
         dof_pos = np.concatenate(
             [np.asarray(raw_data['root_orient'], dtype=np.float32), np.asarray(raw_data['pose_body'], dtype=np.float32)],

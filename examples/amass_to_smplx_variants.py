@@ -39,13 +39,13 @@ FIXED_VIDEO_WIDTH = 720
 FIXED_VIDEO_HEIGHT = 720
 FIXED_OPENGL_PLATFORM = 'egl'
 
-BETA_DIST_MIN = 0.8 * np.array([
+BETA_DIST_MIN = 2.0 * np.array([
     -0.3327, -0.7457, -0.2196, -0.8875,
     -4.6569, -4.0947, -1.0658, -4.2020,
     -2.1913, -2.4934, -1.2069, -3.9970,
     -3.2033, -2.1479, -0.6005, -0.1839,
 ], dtype=np.float32)
-BETA_DIST_MAX = 1.2 * np.array([
+BETA_DIST_MAX = 2.0 * np.array([
     1.7192, 1.0801, 2.1832, 2.2377,
     2.1501, 1.4160, 2.7794, 2.3992,
     1.8828, 2.3267, 3.0854, -0.1402,
@@ -57,7 +57,7 @@ BODY_PARENT_INDICES = (
     -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19,
 )
 BODY_QUAT_ORDER = 'wxyz'
-OUTPUT_NPZ_FIELDS = ['body_names', 'body_pos', 'body_quat', 'betas', 'hz']
+OUTPUT_NPZ_FIELDS = ['body_link_names', 'body_pos_w', 'body_quat_w', 'betas', 'fps']
 
 
 def load_motion(path):
@@ -328,14 +328,14 @@ def build_body_quat(motion_clip):
     return normalize_last_dim(body_quat).astype(np.float32)
 
 
-def save_variant(output_path, body_pos, body_quat, betas, hz):
+def save_variant(output_path, body_pos, body_quat, betas, fps):
     np.savez_compressed(
         output_path,
-        body_names=np.asarray(BODY_NAMES),
-        body_pos=body_pos.astype(np.float32),
-        body_quat=body_quat.astype(np.float32),
+        body_link_names=np.asarray(BODY_NAMES),
+        body_pos_w=body_pos.astype(np.float32),
+        body_quat_w=body_quat.astype(np.float32),
         betas=betas.astype(np.float32),
-        hz=np.float32(hz),
+        fps=np.float32(fps),
     )
 
 
@@ -738,7 +738,7 @@ def generate_variants(
             body_pos=body_pos,
             body_quat=body_quat,
             betas=betas,
-            hz=motion_clip['mocap_frame_rate'],
+            fps=motion_clip['mocap_frame_rate'],
         )
         saved_variants.append({
             'variant_name': variant_name,

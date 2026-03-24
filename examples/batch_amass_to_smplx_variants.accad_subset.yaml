@@ -2,9 +2,9 @@
 # subset files: 118
 # unique local ACCAD matches written below: 118
 # ambiguous subset names expanded to all local candidates: 22
-model_folder: /home/famadio/Workspace/smplx/models
-output_root: /home/famadio/Workspace/smplx/output/accad_subset_local_matches
-motion_root: /home/famadio/Workspace/smplx/ACCAD/
+model_folder: ../models
+output_root: ../output/accad_subset_random_shapes
+motion_root: ../ACCAD/
 num_random_shapes: 7
 seed: 0
 output_fps: 50

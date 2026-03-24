@@ -32,11 +32,11 @@ cd /home/famadio/Workspace/smplx
 ```
 
 Saved `.npz` fields:
-- `body_names`
-- `body_pos`
-- `body_quat`
+- `body_link_names`
+- `body_pos_w`
+- `body_quat_w`
 - `betas`
-- `hz`
+- `fps`
 
 ## Batch Export
 
