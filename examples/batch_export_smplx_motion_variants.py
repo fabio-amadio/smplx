@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-import amass_to_smplx_variants as variants_lib
+import export_smplx_motion_variants as variants_lib
 
 
 BATCH_OPTION_KEYS = (
@@ -28,7 +28,9 @@ BATCH_DEFAULTS = {
     'render_videos': False,
 }
 REQUIRED_CONFIG_KEYS = ('model_folder', 'output_root', 'motions')
-MOTION_ENTRY_KEYS = set(BATCH_OPTION_KEYS) | {'path', 'motion_file', 'output_subdir', 'output_dir'}
+MOTION_ENTRY_KEYS = set(BATCH_OPTION_KEYS) | {
+    'path', 'motion_file', 'output_subdir', 'output_dir', 'seq_name', 'motion_key'
+}
 
 
 def build_arg_parser():
@@ -78,7 +80,15 @@ def normalize_motion_entry(entry):
     return dict(entry)
 
 
-def default_output_subdir(raw_motion_value, motion_path, motion_root):
+def default_output_subdir(entry, raw_motion_value, motion_path, motion_root):
+    seq_name = entry.get('seq_name')
+    if seq_name is not None:
+        return Path(motion_path.stem) / str(seq_name)
+
+    motion_key = entry.get('motion_key')
+    if motion_key is not None:
+        return Path(motion_path.stem) / f'key_{int(motion_key):06d}'
+
     if motion_root is not None:
         try:
             return motion_path.relative_to(motion_root).with_suffix('')
@@ -99,7 +109,7 @@ def resolve_output_dir(entry, output_root, motion_path, motion_root):
     if entry.get('output_subdir') is not None:
         return (output_root / Path(str(entry['output_subdir']))).resolve()
     raw_motion_value = entry.get('path', entry.get('motion_file'))
-    return (output_root / default_output_subdir(raw_motion_value, motion_path, motion_root)).resolve()
+    return (output_root / default_output_subdir(entry, raw_motion_value, motion_path, motion_root)).resolve()
 
 
 def merge_motion_options(config, entry, motion_path):
@@ -185,6 +195,8 @@ def main(argv=None):
 
         options = merge_motion_options(config, entry, motion_path)
         print(f'[{index}/{len(config["motions"])}] {motion_path}')
+        if entry.get('seq_name') is not None or entry.get('motion_key') is not None:
+            print(f'  seq_name={entry.get("seq_name")}, motion_key={entry.get("motion_key")}')
         print(f'  output_dir={output_dir}')
         print(
             f'  start_frame={options["start_frame"]}, num_frames={options["num_frames"]}, '
@@ -197,6 +209,8 @@ def main(argv=None):
                 model_folder=model_folder,
                 motion_file=motion_path,
                 output_dir=output_dir,
+                seq_name=entry.get('seq_name'),
+                motion_key=entry.get('motion_key'),
                 start_frame=options['start_frame'],
                 num_frames=options['num_frames'],
                 output_fps=options['output_fps'],

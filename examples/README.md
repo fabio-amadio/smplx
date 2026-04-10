@@ -2,13 +2,17 @@
 
 This folder contains the main scripts for generating SMPL-X motion variants and inspecting the outputs.
 
+The exporter supports two source formats:
+- SMPL-X `.npz` files such as ACCAD / AMASS
+- OMOMO raw bundle files such as `train_diffusion_manip_seq_joints24.p`
+
 ## Single Motion Export
 
 Generate one motion with the original shape plus random beta variants:
 
 ```bash
-cd /home/famadio/Workspace/smplx
-./.venv/bin/python examples/amass_to_smplx_variants.py \
+cd /home/famadio/Workspace/RETARGETING/smplx
+./.venv/bin/python examples/export_smplx_motion_variants.py \
   --model-folder models \
   --motion-file "ACCAD/Female1General_c3d/A10_-_lie_to_crouch_stageii.npz" \
   --output-dir output/a10_lie_to_crouch_variants \
@@ -20,8 +24,8 @@ cd /home/famadio/Workspace/smplx
 Optional video rendering:
 
 ```bash
-cd /home/famadio/Workspace/smplx
-./.venv/bin/python examples/amass_to_smplx_variants.py \
+cd /home/famadio/Workspace/RETARGETING/smplx
+./.venv/bin/python examples/export_smplx_motion_variants.py \
   --model-folder models \
   --motion-file "ACCAD/Female1General_c3d/A10_-_lie_to_crouch_stageii.npz" \
   --output-dir output/a10_lie_to_crouch_variants_video \
@@ -38,21 +42,40 @@ Saved `.npz` fields:
 - `betas`
 - `fps`
 
+OMOMO example:
+
+```bash
+cd /home/famadio/Workspace/RETARGETING/smplx
+./.venv/bin/python examples/export_smplx_motion_variants.py \
+  --model-folder models \
+  --motion-file "../OMOMO/data/train_diffusion_manip_seq_joints24.p" \
+  --seq-name "sub10_clothesstand_000" \
+  --output-dir output/omomo/sub10_clothesstand_000 \
+  --num-random-shapes 15 \
+  --output-fps 50 \
+  --device cpu
+```
+
+For OMOMO raw bundles, select the sequence with either:
+- `--seq-name`
+- `--motion-key`
+
 ## Batch Export
 
 Batch export is configured through a YAML file. Example config:
-[batch_amass_to_smplx_variants.example.yaml](/home/famadio/Workspace/smplx/examples/batch_amass_to_smplx_variants.example.yaml)
+[batch_export_smplx_motion_variants.example.yaml](/home/famadio/Workspace/RETARGETING/smplx/examples/batch_export_smplx_motion_variants.example.yaml)
 
 Run it with:
 
 ```bash
-cd /home/famadio/Workspace/smplx
-./.venv/bin/python examples/batch_amass_to_smplx_variants.py \
-  examples/batch_amass_to_smplx_variants.example.yaml
+cd /home/famadio/Workspace/RETARGETING/smplx
+./.venv/bin/python examples/batch_export_smplx_motion_variants.py \
+  examples/batch_export_smplx_motion_variants.example.yaml
 ```
 
 The YAML has top-level defaults plus a `motions:` list. Per-motion entries can override:
 - `path` or `motion_file`
+- `seq_name` or `motion_key` for OMOMO raw bundles
 - `output_subdir` or `output_dir`
 - `start_frame`
 - `num_frames`
@@ -67,8 +90,8 @@ The YAML has top-level defaults plus a `motions:` list. Per-motion entries can o
 Plot the difference between `motion_shape.npz` and the random variants inside one generated folder:
 
 ```bash
-cd /home/famadio/Workspace/smplx
-./.venv/bin/python examples/plot_smplx_variant_folder_comparison.py \
+cd /home/famadio/Workspace/RETARGETING/smplx
+./.venv/bin/python examples/plot_motion_variant_folder_comparison.py \
   output/a10_lie_to_crouch_variants
 ```
 

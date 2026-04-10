@@ -68,6 +68,7 @@ setup(name=NAME,
       install_requires=[
           'numpy>=1.16.2',
           'torch>=1.0.1.post2',
+          'joblib>=1.0.0',
       ],
       extras_require={
           'pyrender': pyrender_reqs,

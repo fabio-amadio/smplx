@@ -13,6 +13,18 @@ import smplx
 from smplx.joint_names import JOINT_NAMES
 
 
+AMASS_REQUIRED_KEYS = [
+    'betas',
+    'gender',
+    'mocap_frame_rate',
+    'pose_body',
+    'pose_eye',
+    'pose_hand',
+    'pose_jaw',
+    'root_orient',
+    'surface_model_type',
+    'trans',
+]
 REQUIRED_KEYS = [
     'betas',
     'gender',
@@ -27,6 +39,14 @@ REQUIRED_KEYS = [
 ]
 ROTATION_KEYS = ['root_orient', 'pose_body', 'pose_hand', 'pose_jaw', 'pose_eye']
 LINEAR_KEYS = ['trans']
+OMOMO_MOCAP_FRAME_RATE = 30.0
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_ACCAD_BETA_ROOT = PROJECT_ROOT / 'ACCAD'
+DEFAULT_OMOMO_BETA_BUNDLES = (
+    PROJECT_ROOT.parent / 'OMOMO' / 'data' / 'train_diffusion_manip_seq_joints24.p',
+    PROJECT_ROOT.parent / 'OMOMO' / 'data' / 'test_diffusion_manip_seq_joints24.p',
+)
 
 FRONT_CAMERA = {
     'azimuth_deg': 90.0,
@@ -39,39 +59,149 @@ FIXED_VIDEO_WIDTH = 720
 FIXED_VIDEO_HEIGHT = 720
 FIXED_OPENGL_PLATFORM = 'egl'
 
-BETA_DIST_MIN = 1.6 * np.array([
-    -0.3327, -0.7457, -0.2196, -0.8875,
-    -4.6569, -4.0947, -1.0658, -4.2020,
-    -2.1913, -2.4934, -1.2069, -3.9970,
-    -3.2033, -2.1479, -0.6005, -0.1839,
-], dtype=np.float32)
-BETA_DIST_MAX = 1.6 * np.array([
-    1.7192, 1.0801, 2.1832, 2.2377,
-    2.1501, 1.4160, 2.7794, 2.3992,
-    1.8828, 2.3267, 3.0854, -0.1402,
-    0.4211, 2.1681, 3.5587, 3.2515,
-], dtype=np.float32)
-
 BODY_NAMES = tuple(JOINT_NAMES[:22])
 BODY_PARENT_INDICES = (
     -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19,
 )
 BODY_QUAT_ORDER = 'wxyz'
 OUTPUT_NPZ_FIELDS = ['body_link_names', 'body_pos_w', 'body_quat_w', 'betas', 'fps']
+EMPIRICAL_BETA_POOL_CACHE = {}
 
 
-def load_motion(path):
+def _as_python_scalar(value):
+    array = np.asarray(value)
+    if array.shape == ():
+        return array.item()
+    return value
+
+
+def _normalize_motion_dict(motion_dict):
+    normalized = {}
+    for key, value in motion_dict.items():
+        if key in ('gender', 'surface_model_type', 'seq_name', 'source_format'):
+            normalized[key] = str(_as_python_scalar(value))
+        elif key in ('motion_key', 'num_betas'):
+            normalized[key] = int(_as_python_scalar(value))
+        elif key == 'mocap_frame_rate':
+            normalized[key] = float(_as_python_scalar(value))
+        elif key == 'betas':
+            normalized[key] = np.asarray(value, dtype=np.float32).reshape(-1)
+        elif key in REQUIRED_KEYS:
+            normalized[key] = np.asarray(value, dtype=np.float32)
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def load_npz_motion(path):
     motion = np.load(path, allow_pickle=True)
-    missing = [key for key in REQUIRED_KEYS if key not in motion.files]
+    missing = [key for key in AMASS_REQUIRED_KEYS if key not in motion.files]
     if missing:
         raise KeyError(f'Missing keys in {path}: {missing}')
 
-    surface_model_type = str(motion['surface_model_type']).lower()
+    surface_model_type = str(_as_python_scalar(motion['surface_model_type'])).lower()
     if surface_model_type != 'smplx':
         raise ValueError(
             f'Expected an SMPL-X motion file, got surface_model_type={surface_model_type!r}'
         )
-    return motion
+
+    motion_dict = {
+        key: motion[key]
+        for key in AMASS_REQUIRED_KEYS
+    }
+    motion_dict['surface_model_type'] = surface_model_type
+    motion_dict['source_format'] = 'smplx_npz'
+    motion_dict['seq_name'] = path.stem
+    if 'num_betas' in motion.files:
+        motion_dict['num_betas'] = motion['num_betas']
+    return _normalize_motion_dict(motion_dict)
+
+
+def _import_joblib():
+    try:
+        import joblib
+    except ImportError as exc:
+        raise ImportError(
+            'OMOMO raw bundles require joblib. Install it in this environment with '
+            '`pip install joblib` and retry.'
+        ) from exc
+    return joblib
+
+
+def _resolve_omomo_entry(omomo_data, seq_name=None, motion_key=None):
+    if seq_name is not None and motion_key is not None:
+        raise ValueError('Use either seq_name or motion_key for OMOMO, not both.')
+
+    if seq_name is not None:
+        matches = [
+            (key, seq)
+            for key, seq in omomo_data.items()
+            if str(seq.get('seq_name')) == str(seq_name)
+        ]
+        if not matches:
+            raise KeyError(f'OMOMO sequence {seq_name!r} was not found in the bundle.')
+        if len(matches) > 1:
+            raise ValueError(
+                f'OMOMO sequence name {seq_name!r} is ambiguous inside the bundle: '
+                f'keys={[key for key, _ in matches]}'
+            )
+        return matches[0]
+
+    if motion_key is not None:
+        if motion_key not in omomo_data:
+            raise KeyError(f'OMOMO motion key {motion_key!r} was not found in the bundle.')
+        return motion_key, omomo_data[motion_key]
+
+    raise ValueError(
+        'OMOMO raw bundles contain many sequences. Provide seq_name or motion_key to choose one.'
+    )
+
+
+def load_omomo_motion(path, seq_name=None, motion_key=None):
+    joblib = _import_joblib()
+    omomo_data = joblib.load(path)
+    if not isinstance(omomo_data, dict):
+        raise TypeError(
+            f'Expected OMOMO bundle {path} to contain a dict of sequences, got '
+            f'{type(omomo_data)!r}'
+        )
+
+    resolved_key, seq = _resolve_omomo_entry(omomo_data, seq_name=seq_name, motion_key=motion_key)
+    missing = [key for key in ['betas', 'gender', 'pose_body', 'root_orient', 'trans', 'seq_name'] if key not in seq]
+    if missing:
+        raise KeyError(f'Missing OMOMO keys in {path} for entry {resolved_key}: {missing}')
+
+    num_frames = int(np.asarray(seq['pose_body']).shape[0])
+    motion_dict = {
+        'betas': np.asarray(seq['betas'], dtype=np.float32).reshape(-1),
+        'gender': str(seq['gender']),
+        'mocap_frame_rate': float(OMOMO_MOCAP_FRAME_RATE),
+        'pose_body': np.asarray(seq['pose_body'], dtype=np.float32),
+        'pose_eye': np.zeros((num_frames, 6), dtype=np.float32),
+        'pose_hand': np.zeros((num_frames, 90), dtype=np.float32),
+        'pose_jaw': np.zeros((num_frames, 3), dtype=np.float32),
+        'root_orient': np.asarray(seq['root_orient'], dtype=np.float32),
+        'surface_model_type': 'smplx',
+        'trans': np.asarray(seq['trans'], dtype=np.float32),
+        'source_format': 'omomo_raw_bundle',
+        'seq_name': str(seq['seq_name']),
+        'motion_key': int(resolved_key),
+        'num_betas': int(np.asarray(seq['betas']).reshape(-1).shape[0]),
+    }
+    return _normalize_motion_dict(motion_dict)
+
+
+def load_motion(path, seq_name=None, motion_key=None):
+    suffix = path.suffix.lower()
+    if suffix == '.npz':
+        if seq_name is not None or motion_key is not None:
+            raise ValueError('seq_name and motion_key are only valid for OMOMO raw bundles.')
+        return load_npz_motion(path)
+    if suffix == '.p':
+        return load_omomo_motion(path, seq_name=seq_name, motion_key=motion_key)
+    raise ValueError(
+        f'Unsupported motion file type {suffix!r}. Expected a SMPL-X .npz or OMOMO raw .p bundle.'
+    )
 
 
 def resolve_frame_slice(total_frames, start_frame, num_frames):
@@ -105,23 +235,107 @@ def build_model(model_folder, gender, num_betas, device):
     return model
 
 
-def get_beta_sampling_bounds(num_betas):
-    if num_betas > len(BETA_DIST_MIN):
+def beta_key(betas, num_betas):
+    betas = np.asarray(betas, dtype=np.float32).reshape(-1)
+    if betas.shape[0] < num_betas:
         raise ValueError(
-            f'num_betas={num_betas} exceeds the hard-coded beta bounds length '
-            f'{len(BETA_DIST_MIN)}'
+            f'Expected at least {num_betas} beta coefficients, got {betas.shape[0]}'
         )
-    dist_min = BETA_DIST_MIN[:num_betas]
-    dist_max = BETA_DIST_MAX[:num_betas]
-    if not np.all(dist_min < dist_max):
-        raise ValueError('Each beta min bound must be strictly smaller than its max bound.')
-    return dist_min, dist_max
+    return tuple(np.round(betas[:num_betas], 6).tolist())
 
 
-def sample_random_betas(num_betas, num_samples, seed):
-    dist_min, dist_max = get_beta_sampling_bounds(num_betas)
+def collect_empirical_beta_pool(num_betas):
+    cached = EMPIRICAL_BETA_POOL_CACHE.get(num_betas)
+    if cached is not None:
+        return cached
+
+    unique_betas = {}
+    accad_unique_keys = set()
+    omomo_unique_keys = set()
+    stats = {
+        'sampling': 'empirical_combined_accad_omomo',
+        'num_betas': int(num_betas),
+        'accad_root': str(DEFAULT_ACCAD_BETA_ROOT),
+        'omomo_bundle_files': [],
+        'accad_motion_files_scanned': 0,
+        'accad_unique_betas': 0,
+        'omomo_sequences_scanned': 0,
+        'omomo_unique_betas': 0,
+        'combined_unique_betas': 0,
+    }
+
+    if DEFAULT_ACCAD_BETA_ROOT.exists():
+        for motion_path in DEFAULT_ACCAD_BETA_ROOT.rglob('*.npz'):
+            motion = np.load(motion_path, allow_pickle=True)
+            if 'betas' not in motion.files:
+                continue
+            betas = np.asarray(motion['betas'], dtype=np.float32).reshape(-1)
+            if betas.shape[0] < num_betas:
+                continue
+            stats['accad_motion_files_scanned'] += 1
+            key = beta_key(betas, num_betas)
+            accad_unique_keys.add(key)
+            unique_betas.setdefault(key, betas[:num_betas].copy())
+
+    existing_omomo_bundles = [path for path in DEFAULT_OMOMO_BETA_BUNDLES if path.exists()]
+    stats['omomo_bundle_files'] = [str(path) for path in existing_omomo_bundles]
+    if existing_omomo_bundles:
+        joblib = _import_joblib()
+        for bundle_path in existing_omomo_bundles:
+            bundle = joblib.load(bundle_path)
+            if not isinstance(bundle, dict):
+                raise TypeError(
+                    f'Expected OMOMO bundle {bundle_path} to contain a dict of sequences, '
+                    f'got {type(bundle)!r}'
+                )
+            stats['omomo_sequences_scanned'] += len(bundle)
+            for seq in bundle.values():
+                betas = np.asarray(seq['betas'], dtype=np.float32).reshape(-1)
+                if betas.shape[0] < num_betas:
+                    continue
+                key = beta_key(betas, num_betas)
+                omomo_unique_keys.add(key)
+                unique_betas.setdefault(key, betas[:num_betas].copy())
+
+    stats['accad_unique_betas'] = len(accad_unique_keys)
+    stats['omomo_unique_betas'] = len(omomo_unique_keys)
+    stats['combined_unique_betas'] = len(unique_betas)
+
+    if not unique_betas:
+        raise RuntimeError(
+            'Could not build an empirical beta pool from ACCAD and OMOMO. '
+            'Check that the local datasets are available.'
+        )
+
+    beta_pool = np.stack(list(unique_betas.values()), axis=0).astype(np.float32)
+    cached = {
+        'beta_pool': beta_pool,
+        'stats': stats,
+    }
+    EMPIRICAL_BETA_POOL_CACHE[num_betas] = cached
+    return cached
+
+
+def sample_random_betas(num_betas, num_samples, seed, exclude_betas=None):
+    empirical = collect_empirical_beta_pool(num_betas)
+    candidate_pool = empirical['beta_pool']
+
+    if exclude_betas is not None:
+        exclude_key = beta_key(exclude_betas, num_betas)
+        filtered = np.array(
+            [betas for betas in candidate_pool if beta_key(betas, num_betas) != exclude_key],
+            dtype=np.float32,
+        )
+        if filtered.size > 0:
+            candidate_pool = filtered
+
+    if candidate_pool.shape[0] == 0:
+        raise RuntimeError('The empirical beta pool is empty after excluding the source shape.')
+
     rng = np.random.default_rng(seed)
-    return rng.uniform(dist_min, dist_max, size=(num_samples, num_betas)).astype(np.float32)
+    replace = num_samples > candidate_pool.shape[0]
+    indices = rng.choice(candidate_pool.shape[0], size=num_samples, replace=replace)
+    return candidate_pool[indices].astype(np.float32), empirical['stats']
 
 
 def compute_duration_seconds(num_frames, fps):
@@ -567,12 +781,16 @@ DEFAULT_DEVICE = 'cpu'
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description='Replay one AMASS/ACCAD SMPL-X motion and save shape variants.'
+        description='Replay one SMPL-X motion and save shape variants.'
     )
     parser.add_argument('--model-folder', required=True, type=str,
                         help='Folder that contains the smplx/ model files.')
     parser.add_argument('--motion-file', required=True, type=str,
-                        help='Path to one AMASS/ACCAD .npz motion file.')
+                        help='Path to one SMPL-X .npz motion file or an OMOMO raw .p bundle.')
+    parser.add_argument('--seq-name', default=None, type=str,
+                        help='For OMOMO raw bundles: sequence name to extract, for example sub10_clothesstand_000.')
+    parser.add_argument('--motion-key', default=None, type=int,
+                        help='For OMOMO raw bundles: integer dict key to extract.')
     parser.add_argument('--output-dir', required=True, type=str,
                         help='Directory where the generated variant files are saved.')
     parser.add_argument('--start-frame', default=0, type=int,
@@ -598,36 +816,42 @@ def parse_args(argv=None):
 
 def resolve_motion_betas(motion):
     motion_betas = motion['betas'].astype(np.float32)
-    num_betas = int(motion['num_betas']) if 'num_betas' in motion.files else motion_betas.shape[0]
+    num_betas = int(motion['num_betas']) if 'num_betas' in motion else motion_betas.shape[0]
     num_betas = min(num_betas, motion_betas.shape[0])
     return motion_betas[:num_betas], num_betas
 
 
 def build_variant_specs(motion_betas, num_betas, num_random_shapes, seed):
     variants = [('motion_shape', motion_betas)]
+    beta_sampling_info = None
     if num_random_shapes > 0:
-        sampled = sample_random_betas(
+        sampled, beta_sampling_info = sample_random_betas(
             num_betas=num_betas,
             num_samples=num_random_shapes,
             seed=seed,
+            exclude_betas=motion_betas,
         )
         for idx, betas in enumerate(sampled):
             variants.append((f'random_shape_{idx:04d}', betas))
-    return variants
+    return variants, beta_sampling_info
 
 
 def build_manifest(
     motion_path,
     model_folder,
+    motion,
     motion_clip,
     num_betas,
     variants,
+    beta_sampling_info,
     render_videos,
 ):
-    dist_min, dist_max = get_beta_sampling_bounds(num_betas)
     video_fps = float(motion_clip['mocap_frame_rate']) if render_videos else None
     return {
         'motion_file': str(motion_path),
+        'motion_source_format': motion.get('source_format', 'smplx_npz'),
+        'motion_seq_name': motion.get('seq_name'),
+        'motion_key': motion.get('motion_key'),
         'model_folder': str(model_folder),
         'gender': motion_clip['gender'],
         'surface_model_type': motion_clip['surface_model_type'],
@@ -646,9 +870,8 @@ def build_manifest(
         'output_npz_fields': list(OUTPUT_NPZ_FIELDS),
         'num_variants': len(variants),
         'variants': [name for name, _ in variants],
-        'random_beta_sampling': 'uniform_per_dimension',
-        'random_beta_dist_min': dist_min.tolist(),
-        'random_beta_dist_max': dist_max.tolist(),
+        'random_beta_sampling': None if beta_sampling_info is None else beta_sampling_info['sampling'],
+        'random_beta_pool': beta_sampling_info,
         'render_videos': bool(render_videos),
         'video_fps': video_fps,
         'video_width': FIXED_VIDEO_WIDTH if render_videos else None,
@@ -673,6 +896,8 @@ def generate_variants(
     model_folder,
     motion_file,
     output_dir,
+    seq_name=None,
+    motion_key=None,
     start_frame=0,
     num_frames=None,
     output_fps=None,
@@ -687,19 +912,26 @@ def generate_variants(
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    motion = load_motion(motion_path)
+    motion = load_motion(motion_path, seq_name=seq_name, motion_key=motion_key)
     total_frames = motion['trans'].shape[0]
     frame_slice = resolve_frame_slice(total_frames, start_frame, num_frames)
     motion_clip = prepare_motion_clip(motion, frame_slice, output_fps=output_fps)
 
     motion_betas, num_betas = resolve_motion_betas(motion)
-    variants = build_variant_specs(motion_betas, num_betas, num_random_shapes, seed)
+    variants, beta_sampling_info = build_variant_specs(
+        motion_betas,
+        num_betas,
+        num_random_shapes,
+        seed,
+    )
     manifest = build_manifest(
         motion_path=motion_path,
         model_folder=model_folder,
+        motion=motion,
         motion_clip=motion_clip,
         num_betas=num_betas,
         variants=variants,
+        beta_sampling_info=beta_sampling_info,
         render_videos=render_videos,
     )
     manifest_path = write_manifest(output_dir, manifest)
@@ -707,9 +939,11 @@ def generate_variants(
     torch_device = torch.device(device)
     model = build_model(str(model_folder), str(motion['gender']), num_betas, torch_device)
 
-    dist_min, dist_max = get_beta_sampling_bounds(num_betas)
     if log_fn is not None:
-        log_fn(f'Motion: {motion_path}')
+        label = motion.get('seq_name') if motion.get('source_format') == 'omomo_raw_bundle' else motion_path
+        log_fn(f'Motion: {label}')
+        if motion.get('source_format') == 'omomo_raw_bundle':
+            log_fn(f'OMOMO bundle: {motion_path} (key={motion.get("motion_key")})')
         log_fn(
             f'Source frames: {motion_clip["source_num_frames"]} @ {motion_clip["source_mocap_frame_rate"]:.6f} Hz '
             f'-> output frames: {motion_clip["num_frames"]} @ {motion_clip["mocap_frame_rate"]:.6f} Hz'
@@ -717,7 +951,15 @@ def generate_variants(
         log_fn(f'Duration: {motion_clip["duration_seconds"]:.6f} s')
         log_fn(f'Original frame window: {motion_clip["frame_start"]}:{motion_clip["frame_end"]}')
         log_fn(f'Output dir: {output_dir}')
-        log_fn(f'Random beta sampling: uniform per dimension in [{dist_min.tolist()}, {dist_max.tolist()}]')
+        if beta_sampling_info is None:
+            log_fn('Random beta sampling: disabled (num_random_shapes=0)')
+        else:
+            log_fn(
+                'Random beta sampling: empirical combined ACCAD+OMOMO pool '
+                f'with {beta_sampling_info["combined_unique_betas"]} unique shapes '
+                f'(ACCAD={beta_sampling_info["accad_unique_betas"]}, '
+                f'OMOMO={beta_sampling_info["omomo_unique_betas"]})'
+            )
         if render_videos:
             log_fn(
                 f'Video rendering enabled: {motion_clip["mocap_frame_rate"]:.6f} fps, '
@@ -768,6 +1010,9 @@ def generate_variants(
 
     return {
         'motion_file': str(motion_path),
+        'motion_source_format': motion.get('source_format', 'smplx_npz'),
+        'motion_seq_name': motion.get('seq_name'),
+        'motion_key': motion.get('motion_key'),
         'output_dir': str(output_dir),
         'manifest_path': str(manifest_path),
         'source_num_frames': int(motion_clip['source_num_frames']),
@@ -788,6 +1033,8 @@ def generate_variants_from_args(args, log_fn=print):
         model_folder=args.model_folder,
         motion_file=args.motion_file,
         output_dir=args.output_dir,
+        seq_name=args.seq_name,
+        motion_key=args.motion_key,
         start_frame=args.start_frame,
         num_frames=args.num_frames,
         output_fps=args.output_fps,
