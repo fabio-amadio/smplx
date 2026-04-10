@@ -39,13 +39,13 @@ FIXED_VIDEO_WIDTH = 720
 FIXED_VIDEO_HEIGHT = 720
 FIXED_OPENGL_PLATFORM = 'egl'
 
-BETA_DIST_MIN = 2.0 * np.array([
+BETA_DIST_MIN = 1.6 * np.array([
     -0.3327, -0.7457, -0.2196, -0.8875,
     -4.6569, -4.0947, -1.0658, -4.2020,
     -2.1913, -2.4934, -1.2069, -3.9970,
     -3.2033, -2.1479, -0.6005, -0.1839,
 ], dtype=np.float32)
-BETA_DIST_MAX = 2.0 * np.array([
+BETA_DIST_MAX = 1.6 * np.array([
     1.7192, 1.0801, 2.1832, 2.2377,
     2.1501, 1.4160, 2.7794, 2.3992,
     1.8828, 2.3267, 3.0854, -0.1402,
